@@ -6,7 +6,10 @@
 # only used by the web pipeline's earlier stages, not by execute/validate.
 
 # --- GUI: native WebView wrapper (no bundled browser engine) ---
-pywebview>=5.0
+# Versions pinned to the combination verified to package correctly on Windows.
+pywebview==6.2.1
+pythonnet==3.1.0
+clr_loader==0.3.1
 
 # --- Conversion + validation core (used by the vendored autobidsify code) ---
 numpy

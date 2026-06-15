@@ -10,9 +10,17 @@
 # (Edge WebView2 on Windows, WebKit on macOS, WebKitGTK on Linux), so no
 # browser engine is bundled — that keeps the package small.
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 block_cipher = None
+
+# --- pythonnet / .NET runtime (Windows WinForms backend of pywebview) ---
+# On Windows pywebview loads .NET via pythonnet (clr). PyInstaller does not
+# pick up Python.Runtime.dll and the clr_loader runtime files automatically,
+# which causes "Failed to resolve Python.Runtime.Loader.Initialize" at launch.
+# collect_all pulls in those binaries/data so the packaged app can load .NET.
+_pn_datas, _pn_binaries, _pn_hidden = collect_all("pythonnet")
+_cl_datas, _cl_binaries, _cl_hidden = collect_all("clr_loader")
 
 # --- Data files: ship the web UI and the vendored autobidsify source ---
 datas = [
@@ -31,7 +39,7 @@ for pkg in ["scipy", "h5py", "nibabel", "snirf", "bjdata",
             "bids_validator", "bidsschematools", "yaml", "numpy"]:
     hidden += collect_submodules(pkg)
 
-# pywebview backend hooks (Windows uses the EdgeChromium / WebView2 backend).
+# pywebview backend hooks (Windows uses the WinForms backend via pythonnet).
 hidden += [
     "webview",
     "webview.platforms.winforms",   # Windows backend
@@ -39,6 +47,11 @@ hidden += [
     "proxy_tools",
     "bottle",
 ]
+
+# Merge the pythonnet / clr_loader collections gathered above.
+datas += _pn_datas + _cl_datas
+hidden += _pn_hidden + _cl_hidden
+binaries = _pn_binaries + _cl_binaries
 
 # --- Excludes: drop large modules we never use, to shrink the package ---
 excludes = [
@@ -56,7 +69,7 @@ excludes = [
 a = Analysis(
     ["main.py"],
     pathex=["vendor"],     # so 'import autobidsify' resolves to vendored copy
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
