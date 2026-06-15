@@ -16,12 +16,17 @@ jobs:
           - os: windows-latest
             artifact: AutoBIDSify-Windows
             archive: zip
+            pyver: "3.14"
           - os: macos-latest          # Apple Silicon (arm64)
             artifact: AutoBIDSify-macOS-arm64
             archive: zip
-          - os: ubuntu-latest
+            pyver: "3.14"
+          - os: ubuntu-22.04
             artifact: AutoBIDSify-Linux
             archive: tar
+            # 3.12 links against an older GLIBC than 3.14, so the Linux build
+            # runs on Ubuntu 22.04 (GLIBC 2.35) and older systems.
+            pyver: "3.12"
 
     defaults:
       run:
@@ -31,16 +36,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.14
+      - name: Set up Python ${{ matrix.pyver }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.pyver }}
 
-      # pywebview's GTK backend is only needed to *display* a window at
-      # runtime. PyInstaller only needs to import the webview package to
-      # bundle it, so the build does NOT require a working GTK stack. We skip
-      # the heavy pycairo/PyGObject build here. End users install WebKitGTK
-      # on their own machine (documented in the README).
+      # Tkinter needs the system Tk libraries to be present so PyInstaller can
+      # bundle them. The GitHub Ubuntu runner does not always include them.
+      - name: Install Tk libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk
 
       - name: Install dependencies
         run: |
