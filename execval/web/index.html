@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -51,6 +51,11 @@
     padding:16px 18px;display:flex;flex-direction:column;gap:4px;justify-content:center;cursor:pointer;
     transition:.18s;min-height:70px}
   .dropzone.hover{border-color:var(--accent);background:var(--accent-soft)}
+  .btn-stack{display:flex;flex-direction:column;gap:8px}
+  .btn-stack .btn{justify-content:center}
+  .added-list{margin-top:8px;display:flex;flex-direction:column;gap:3px;max-height:96px;overflow:auto;width:100%}
+  .added-item{font-family:var(--mono);font-size:11px;color:var(--txt-dim);display:flex;align-items:center;gap:6px}
+  .added-item .ic{color:var(--txt-faint);flex-shrink:0}
   .dz-main{font-size:13px;font-weight:500}.dz-sub{font-size:11px;color:var(--txt-faint)}
 
   .pathfield{flex:1;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel2);
@@ -125,10 +130,15 @@
       <span class="section-hint">from web pipeline</span></div>
     <div class="row">
       <div class="dropzone" id="dropzone">
-        <span class="dz-main">Drop plan files here</span>
-        <span class="dz-sub">folder · .zip · or individual files — recognized by name</span>
+        <span class="dz-main" id="dzMain">No items added yet</span>
+        <span class="dz-sub">add files (incl. .zip) and/or folders — recognized by name</span>
+        <div class="added-list" id="addedList"></div>
       </div>
-      <button class="btn" id="browseBtn">Browse</button>
+      <div class="btn-stack">
+        <button class="btn" id="addFilesBtn">Add Files</button>
+        <button class="btn" id="addFolderBtn">Add Folder</button>
+        <button class="btn" id="clearBundleBtn">Clear</button>
+      </div>
     </div>
     <div class="status-line" id="statusLine"></div>
   </div>
@@ -175,6 +185,230 @@
     <button class="open-btn" id="openBtn" disabled>Open Output Folder</button>
   </div>
 
-  <script src="app.js"></script>
+  <script>
+/*
+ * app.js
+ * ======
+ * Frontend logic for AutoBIDSify Desktop.
+ *
+ * Talks to Python through the pywebview bridge:
+ *   - call Python:  await window.pywebview.api.<method>(...)
+ *   - Python -> UI: Python calls window.appendLog(...) and window.setState(...)
+ *
+ * State held here: the chosen bundle paths, input dir, and output dir.
+ */
+
+(function () {
+  "use strict";
+
+  // ---- application state ----
+  const state = {
+    bundlePaths: [],
+    bundleResult: null,
+    inputDir: null,
+    outputDir: null,
+    running: false,
+  };
+
+  const REQUIRED = [
+    "BIDSPlan.yaml",
+    "dataset_description.json", "README.md", "participants.tsv",
+  ];
+  const OPTIONAL = ["mat_mapping.json", "headers_normalized.json", "voxel_final_plan.json"];
+
+  // ---- element refs ----
+  const $ = (id) => document.getElementById(id);
+  const dropzone = $("dropzone");
+  const statusLine = $("statusLine");
+  const inputField = $("inputField");
+  const outputField = $("outputField");
+  const runBtn = $("runBtn");
+  const openBtn = $("openBtn");
+  const logEl = $("log");
+  const stateEl = $("state");
+
+  // ---- theme toggle ----
+  $("themeToggle").addEventListener("click", () => {
+    const root = document.documentElement;
+    const isLight = root.getAttribute("data-theme") === "light";
+    root.setAttribute("data-theme", isLight ? "dark" : "light");
+  });
+
+  const addedList = $("addedList");
+  const dzMain = $("dzMain");
+
+  // ---- bundle: add files / add folder / clear (accumulating) ----
+  $("addFilesBtn").addEventListener("click", async () => {
+    const files = await window.pywebview.api.pick_files();
+    if (files && files.length) addBundlePaths(files);
+  });
+
+  $("addFolderBtn").addEventListener("click", async () => {
+    const folder = await window.pywebview.api.pick_folder();
+    if (folder) addBundlePaths([folder]);
+  });
+
+  $("clearBundleBtn").addEventListener("click", () => {
+    state.bundlePaths = [];
+    state.bundleResult = null;
+    renderAddedList();
+    renderChips();
+    refreshRunEnabled();
+  });
+
+  // Drag/drop kept as a best-effort extra (pywebview path support varies).
+  dropzone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    dropzone.classList.add("hover");
+  });
+  dropzone.addEventListener("dragleave", () => dropzone.classList.remove("hover"));
+  dropzone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropzone.classList.remove("hover");
+    const paths = [];
+    if (e.dataTransfer && e.dataTransfer.files) {
+      for (const f of e.dataTransfer.files) {
+        if (f.path) paths.push(f.path);
+      }
+    }
+    if (paths.length) addBundlePaths(paths);
+  });
+
+  // Accumulate new paths onto the existing selection (deduplicated),
+  // then re-resolve the whole set and refresh the UI.
+  async function addBundlePaths(paths) {
+    for (const p of paths) {
+      if (!state.bundlePaths.includes(p)) state.bundlePaths.push(p);
+    }
+    renderAddedList();
+    state.bundleResult = await window.pywebview.api.resolve_bundle(state.bundlePaths);
+    renderChips();
+    refreshRunEnabled();
+  }
+
+  // Show the list of items the user has added so far.
+  function renderAddedList() {
+    addedList.innerHTML = "";
+    if (state.bundlePaths.length === 0) {
+      dzMain.textContent = "No items added yet";
+      return;
+    }
+    dzMain.textContent = `${state.bundlePaths.length} item(s) added:`;
+    for (const p of state.bundlePaths) {
+      const div = document.createElement("div");
+      div.className = "added-item";
+      div.innerHTML =
+        `<span class="ic">•</span>${p.replace(/\\/g, "/").split("/").slice(-2).join("/")}`;
+      addedList.appendChild(div);
+    }
+  }
+
+  function renderChips() {
+    const found = (state.bundleResult && state.bundleResult.found) || {};
+    const provided = state.bundleResult !== null;  // has the user dropped anything yet?
+    const all = REQUIRED.concat(OPTIONAL);
+    statusLine.innerHTML = "";
+    for (const name of all) {
+      const span = document.createElement("span");
+      const isOptional = OPTIONAL.includes(name);
+      if (found[name]) {
+        // Located in the provided bundle.
+        span.className = "chip ok";
+        span.innerHTML = `<span class="tick">✓</span>${name}${isOptional ? " (optional)" : ""}`;
+      } else if (!provided) {
+        // Nothing dropped yet — show the checklist in a neutral pending state.
+        span.className = "chip opt";
+        span.innerHTML = `<span class="tick">○</span>${name}${isOptional ? " (optional)" : ""}`;
+      } else if (isOptional) {
+        // Provided a bundle, but this optional file is absent — that's fine.
+        span.className = "chip opt";
+        span.innerHTML = `<span class="tick">○</span>${name} (optional)`;
+      } else {
+        // Provided a bundle, but a REQUIRED file is missing — flag it.
+        span.className = "chip miss";
+        span.innerHTML = `<span class="tick">✗</span>${name}`;
+      }
+      statusLine.appendChild(span);
+    }
+  }
+
+  // Show the 7-file checklist immediately on load (neutral pending state),
+  // so users can see exactly which files are needed before dropping anything.
+  renderChips();
+
+  // ---- folder pickers ----
+  $("inputBtn").addEventListener("click", async () => {
+    const dir = await window.pywebview.api.pick_folder();
+    if (dir) {
+      state.inputDir = dir;
+      inputField.textContent = dir;
+      inputField.classList.remove("ph");
+      refreshRunEnabled();
+    }
+  });
+  $("outputBtn").addEventListener("click", async () => {
+    const dir = await window.pywebview.api.pick_folder();
+    if (dir) {
+      state.outputDir = dir;
+      outputField.textContent = dir;
+      outputField.classList.remove("ph");
+      refreshRunEnabled();
+    }
+  });
+
+  // ---- run gating ----
+  function refreshRunEnabled() {
+    const ready =
+      state.bundleResult && state.bundleResult.is_complete &&
+      state.inputDir && state.outputDir && !state.running;
+    runBtn.disabled = !ready;
+  }
+
+  // ---- execute ----
+  runBtn.addEventListener("click", async () => {
+    if (runBtn.disabled) return;
+    logEl.innerHTML = "";
+    openBtn.disabled = true;
+    const res = await window.pywebview.api.run_pipeline({
+      bundle_paths: state.bundlePaths,
+      input_dir: state.inputDir,
+      output_dir: state.outputDir,
+      validate: $("validateChk").checked,
+    });
+    if (!res || !res.started) return;
+  });
+
+  $("clearBtn").addEventListener("click", () => { logEl.innerHTML = ""; });
+
+  openBtn.addEventListener("click", () => {
+    if (state.outputDir) window.pywebview.api.open_output(state.outputDir);
+  });
+
+  // ---- updates pushed from Python ----
+  // colorize by tag and append a line, then scroll to bottom.
+  window.appendLog = function (line) {
+    const div = document.createElement("div");
+    let cls = "";
+    if (line.includes("[FATAL]") || line.includes("[ERROR]")) cls = "err";
+    else if (line.includes("[WARN")) cls = "warn";
+    else if (line.includes("✓") || /complete|done\.?$/i.test(line)) cls = "ok";
+    else if (line.includes("[INFO]") || line.includes("[WORKER]")) cls = "tag";
+    div.className = cls;
+    div.textContent = line;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  window.setState = function (s) {
+    state.running = (s === "running");
+    const labels = { idle: "IDLE", running: "● RUNNING", done: "● DONE", error: "● ERROR" };
+    stateEl.className = "state " + (s === "idle" ? "" : s);
+    stateEl.innerHTML = `<span class="dot"></span>${labels[s] || "IDLE"}`;
+    if (s === "done") openBtn.disabled = false;
+    refreshRunEnabled();
+  };
+})();
+
+</script>
 </body>
 </html>

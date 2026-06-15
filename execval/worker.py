@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import sys
 import traceback
@@ -30,6 +31,15 @@ from typing import Any, Callable, Dict, Optional
 
 
 LogFn = Callable[[str], None]
+
+# Matches ANSI color / control escape sequences (e.g. "\033[92m", "\033[0m").
+# The autobidsify library colorizes terminal output with these; they render as
+# garbage in the HTML log view, so we strip them from captured lines.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 # bundle filename -> where execute expects it
 _STAGING_FILES = {
@@ -52,12 +62,12 @@ class _LineStream(io.TextIOBase):
         self._buffer += s
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            self._emit(line)
+            self._emit(_strip_ansi(line))
         return len(s)
 
     def flush(self) -> None:  # type: ignore[override]
         if self._buffer:
-            self._emit(self._buffer)
+            self._emit(_strip_ansi(self._buffer))
             self._buffer = ""
 
 

@@ -38,13 +38,16 @@ from typing import Dict, List, Optional
 
 REQUIRED_FILES: List[str] = [
     "BIDSPlan.yaml",
-    "mat_mapping.json",
     "dataset_description.json",
     "README.md",
     "participants.tsv",
 ]
 
 OPTIONAL_FILES: List[str] = [
+    # mat_mapping.json exists only when the dataset has fNIRS data stored as
+    # .mat (Homer3/MATLAB). EEG, MRI, and SNIRF-based fNIRS datasets do not
+    # produce it, so it must be optional.
+    "mat_mapping.json",
     "headers_normalized.json",
     "voxel_final_plan.json",
 ]
