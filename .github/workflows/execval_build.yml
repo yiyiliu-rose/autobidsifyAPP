@@ -36,17 +36,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      # pywebview needs WebKitGTK on Linux; the runner has sudo to install it.
-      - name: Install Linux WebView dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgirepository1.0-dev gir1.2-gtk-3.0 \
-            gir1.2-webkit2-4.1 || \
-          sudo apt-get install -y \
-            libgirepository1.0-dev gir1.2-gtk-3.0 gir1.2-webkit2-4.0
-          python -m pip install pycairo PyGObject
+      # pywebview's GTK backend is only needed to *display* a window at
+      # runtime. PyInstaller only needs to import the webview package to
+      # bundle it, so the build does NOT require a working GTK stack. We skip
+      # the heavy pycairo/PyGObject build here. End users install WebKitGTK
+      # on their own machine (documented in the README).
 
       - name: Install dependencies
         run: |
