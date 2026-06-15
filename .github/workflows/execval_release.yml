@@ -104,13 +104,23 @@ jobs:
       - name: List downloaded files
         run: find release_files -type f
 
+      - name: Determine release tag and name
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=execval-manual-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+            echo "name=ExecVal manual build ${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # When triggered by a tag, that tag is used. For manual runs, a
-          # name is generated so the release is still created for testing.
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('execval-manual-{0}', github.run_number) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('ExecVal manual build #{0}', github.run_number) }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
           body: |
             AutoBIDSify ExecVal desktop app — local execute & validate.
 
