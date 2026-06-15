@@ -1,0 +1,125 @@
+name: Release ExecVal (3 platforms)
+
+# Step 2a: build all three platforms and publish a GitHub Release with the
+# packaged apps attached. Triggered by pushing a tag like "execval-v0.1.0",
+# or manually (workflow_dispatch) for testing.
+on:
+  push:
+    tags:
+      - "execval-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to create a Release
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: AutoBIDSify-Windows
+            archive: zip
+            pyver: "3.14"
+          - os: macos-latest
+            artifact: AutoBIDSify-macOS-arm64
+            archive: zip
+            pyver: "3.14"
+          - os: ubuntu-22.04
+            artifact: AutoBIDSify-Linux
+            archive: tar
+            pyver: "3.12"
+
+    defaults:
+      run:
+        working-directory: execval
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.pyver }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.pyver }}
+
+      - name: Install Linux Tk libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pyinstaller
+
+      - name: Run unit tests
+        run: python -m pytest
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec
+
+      - name: Archive (zip, Windows/macOS)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path AutoBIDSify -DestinationPath ${{ matrix.artifact }}.zip"
+          else
+            zip -r ${{ matrix.artifact }}.zip AutoBIDSify
+          fi
+
+      - name: Archive (tar.gz, Linux)
+        if: matrix.archive == 'tar'
+        run: |
+          cd dist
+          tar -czf ${{ matrix.artifact }}.tar.gz AutoBIDSify
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            execval/dist/${{ matrix.artifact }}.zip
+            execval/dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_files
+
+      - name: List downloaded files
+        run: find release_files -type f
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # When triggered by a tag, that tag is used. For manual runs, a
+          # name is generated so the release is still created for testing.
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('execval-manual-{0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('ExecVal manual build #{0}', github.run_number) }}
+          body: |
+            AutoBIDSify ExecVal desktop app — local execute & validate.
+
+            Downloads:
+            - Windows: AutoBIDSify-Windows.zip
+            - macOS (Apple Silicon): AutoBIDSify-macOS-arm64.zip
+            - Linux: AutoBIDSify-Linux.tar.gz
+
+            Linux note: requires a desktop environment (Tk). Built for GLIBC 2.35+.
+          files: release_files/**/*
+          draft: false
+          prerelease: false
