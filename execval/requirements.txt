@@ -1,15 +1,12 @@
 # AutoBIDSify ExecVal — desktop app dependencies
 #
-# Trimmed on purpose: only what execute + validate need, plus the GUI.
+# GUI uses Tkinter, which ships with Python — NO GUI library to install,
+# and no pywebview / pythonnet / .NET / Qt / GTK dependencies. This keeps
+# the package small and makes PyInstaller packaging rock-solid.
+#
 # LLM clients (openai / ollama / dashscope) and document parsers
-# (pdfplumber / PyPDF2 / python-docx) are intentionally excluded — they are
-# only used by the web pipeline's earlier stages, not by execute/validate.
-
-# --- GUI: native WebView wrapper (no bundled browser engine) ---
-# Versions pinned to the combination verified to package correctly on Windows.
-pywebview==6.2.1
-pythonnet==3.1.0
-clr_loader==0.3.1
+# (pdfplumber / PyPDF2 / python-docx) are intentionally excluded — only the
+# web pipeline's earlier stages use them, not execute/validate.
 
 # --- Conversion + validation core (used by the vendored autobidsify code) ---
 numpy
@@ -21,6 +18,3 @@ bjdata            # JNIfTI (.jnii/.bnii) support
 bids-validator    # Tier-1 validation
 dcm2niix          # provides the dcm2niix binary on PATH (DICOM -> NIfTI)
 PyYAML            # read BIDSPlan.yaml; utils.write_yaml
-
-# Note: pydicom is NOT required by the execute path (DICOM conversion shells
-# out to the dcm2niix binary). Add it only if a future code path imports it.
