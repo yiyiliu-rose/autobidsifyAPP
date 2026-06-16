@@ -1,0 +1,203 @@
+name: Sync vendor & Release (auto)
+
+# Step 2b: triggered remotely by the autobidsify repo after a successful PyPI
+# deploy (via repository_dispatch). Pulls the 8 vendored files from the
+# autobidsify repo, compares their hashes against the recorded ones, and ONLY
+# if something changed: updates vendor/, records new hashes, builds all three
+# platforms, and publishes a Release.
+on:
+  repository_dispatch:
+    types: [autobidsify-deployed]
+  workflow_dispatch:        # allow manual runs for testing
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------
+  # JOB 1: sync the 8 files and decide whether anything changed
+  # ---------------------------------------------------------------
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      - name: Checkout autobidsify repo (source of the 8 files)
+        uses: actions/checkout@v4
+        with:
+          repository: COTILab/autobidsify
+          path: _autobidsify_src
+
+      - name: Copy the 8 vendored files and compare hashes
+        id: diff
+        shell: bash
+        run: |
+          SRC=_autobidsify_src/autobidsify
+          DST=execval/vendor/autobidsify
+          FILES=(
+            "__init__.py"
+            "utils.py"
+            "converters/executor.py"
+            "converters/validators.py"
+            "converters/mri_convert.py"
+            "converters/jnifti_converter.py"
+            "converters/nirs_convert.py"
+            "converters/eeg_convert.py"
+          )
+
+          HASHFILE=execval/vendor/.sync_hashes.txt
+          NEWHASHES=$(mktemp)
+          for f in "${FILES[@]}"; do
+            if [ ! -f "$SRC/$f" ]; then
+              echo "ERROR: source file missing: $SRC/$f"; exit 1
+            fi
+            h=$(sha256sum "$SRC/$f" | awk '{print $1}')
+            echo "$h  $f" >> "$NEWHASHES"
+          done
+
+          sort -o "$NEWHASHES" "$NEWHASHES"
+
+          if [ -f "$HASHFILE" ] && diff -q <(sort "$HASHFILE") "$NEWHASHES" >/dev/null; then
+            echo "No change in the 8 vendored files. Skipping build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Vendored files changed (or first sync). Updating vendor/."
+          for f in "${FILES[@]}"; do
+            mkdir -p "$DST/$(dirname "$f")"
+            cp "$SRC/$f" "$DST/$f"
+          done
+          cp "$NEWHASHES" "$HASHFILE"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated vendor files
+        if: steps.diff.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add execval/vendor/autobidsify execval/vendor/.sync_hashes.txt
+          git commit -m "Auto-sync vendored autobidsify files after PyPI deploy" || echo "nothing to commit"
+          git push
+
+  # ---------------------------------------------------------------
+  # JOB 2: build 3 platforms + release (only if files changed)
+  # ---------------------------------------------------------------
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: AutoBIDSify-Windows
+            archive: zip
+            pyver: "3.14"
+          - os: macos-latest
+            artifact: AutoBIDSify-macOS-arm64
+            archive: zip
+            pyver: "3.14"
+          - os: ubuntu-22.04
+            artifact: AutoBIDSify-Linux
+            archive: tar
+            pyver: "3.12"
+    defaults:
+      run:
+        working-directory: execval
+    steps:
+      - name: Checkout repository (with freshly synced vendor)
+        uses: actions/checkout@v4
+        with:
+          ref: main          # get the commit the sync job just pushed
+
+      - name: Set up Python ${{ matrix.pyver }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.pyver }}
+
+      - name: Install Linux Tk libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pyinstaller
+
+      - name: Run unit tests
+        run: python -m pytest
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec
+
+      - name: Archive (zip, Windows/macOS)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path AutoBIDSify -DestinationPath ${{ matrix.artifact }}.zip"
+          else
+            zip -r ${{ matrix.artifact }}.zip AutoBIDSify
+          fi
+
+      - name: Archive (tar.gz, Linux)
+        if: matrix.archive == 'tar'
+        run: |
+          cd dist
+          tar -czf ${{ matrix.artifact }}.tar.gz AutoBIDSify
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            execval/dist/${{ matrix.artifact }}.zip
+            execval/dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_files
+
+      - name: Determine release tag and name
+        id: meta
+        shell: bash
+        run: |
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          echo "tag=execval-auto-$STAMP" >> "$GITHUB_OUTPUT"
+          echo "name=ExecVal auto build $STAMP" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          body: |
+            AutoBIDSify ExecVal desktop app — local execute & validate.
+            Auto-built after an autobidsify PyPI release that changed the core files.
+
+            Downloads:
+            - Windows: AutoBIDSify-Windows.zip
+            - macOS (Apple Silicon): AutoBIDSify-macOS-arm64.zip
+            - Linux: AutoBIDSify-Linux.tar.gz
+
+            Linux note: requires a desktop environment (Tk). Built for GLIBC 2.35+.
+          files: release_files/**/*
+          draft: false
+          prerelease: false
