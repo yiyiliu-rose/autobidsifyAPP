@@ -37,6 +37,7 @@ from typing import Dict, List, Optional
 
 
 REQUIRED_FILES: List[str] = [
+    "ingest_info.json",
     "BIDSPlan.yaml",
     "dataset_description.json",
     "README.md",

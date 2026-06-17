@@ -18,6 +18,7 @@ pattern). bundle.py, worker.py and the vendored autobidsify code are unchanged.
 from __future__ import annotations
 
 import os
+import json
 import queue
 import sys
 import threading
@@ -55,8 +56,8 @@ LIGHT = {
     "term_bg": "#10151c", "term_txt": "#7ee787", "run_txt": "#ffffff",
 }
 
-REQUIRED = ["BIDSPlan.yaml", "dataset_description.json", "README.md",
-            "participants.tsv"]
+REQUIRED = ["ingest_info.json", "BIDSPlan.yaml", "dataset_description.json",
+            "README.md", "participants.tsv"]
 OPTIONAL = ["mat_mapping.json", "headers_normalized.json", "voxel_final_plan.json"]
 
 _WIN = sys.platform.startswith("win")
@@ -75,6 +76,7 @@ class App:
         self.bundle_result = None
         self.input_dir: Optional[str] = None
         self.output_dir: Optional[str] = None
+        self.advanced_open = False
         self.running = False
         self.log_queue = queue.Queue()
         self._headers = []
@@ -112,9 +114,42 @@ class App:
                                 font=(MONO[0], 8))
         self.lbl_sub.pack(side="right", padx=10)
 
-        self._section_header("i.", "Plan Bundle", "from web pipeline")
+        self._section_header("1", "Plan Bundle", "from web pipeline")
+
+        # --- Simple mode: one folder field + Select ---
+        simple_row = tk.Frame(self.main)
+        simple_row.pack(fill="x", padx=20, pady=(0, 4))
+        self._simple_row = simple_row
+        self.simple_field = tk.Label(
+            simple_row, text="Select downloaded folder from our web...",
+            font=(MONO[0], 9), anchor="w", relief="flat", borderwidth=1,
+            padx=10, pady=6)
+        self.simple_field.pack(side="left", fill="x", expand=True, ipady=3)
+        self.btn_simple_select = tk.Button(
+            simple_row, text="Select", font=(SANS[0], 10), relief="flat",
+            cursor="hand2", padx=12, pady=4, command=self._pick_bundle_folder)
+        self.btn_simple_select.pack(side="right", padx=(8, 0))
+
+        # --- File check chips (required row + supplementary row) ---
+        self.chips = tk.Text(self.main, height=2, font=(MONO[0], 9),
+                             wrap="word", relief="flat", borderwidth=0,
+                             highlightthickness=0)
+        self.chips.pack(fill="x", padx=20, pady=(2, 4))
+        self.chips.configure(state="disabled", cursor="arrow")
+
+        # --- Advanced toggle (below the file check) ---
+        adv_head = tk.Frame(self.main)
+        adv_head.pack(fill="x", padx=20, pady=(0, 2))
+        self._adv_head = adv_head
+        self.btn_advanced = tk.Button(
+            adv_head, text="\u25b8 Advanced \u2014 add files manually",
+            font=(SANS[0], 9, "underline"), relief="flat",
+            cursor="hand2", borderwidth=0, command=self._toggle_advanced)
+        self.btn_advanced.pack(side="left")
+
+        # --- Advanced mode (hidden by default): file list + Add/Clear ---
         bundle_row = tk.Frame(self.main)
-        bundle_row.pack(fill="x", padx=20, pady=(0, 4))
+        self._adv_body = bundle_row
         self.bundle_box = tk.Text(bundle_row, height=3, font=(MONO[0], 9),
                                   wrap="none", relief="flat", borderwidth=1,
                                   spacing1=6, padx=10, pady=8)
@@ -134,17 +169,13 @@ class App:
                                          command=self._clear_bundle, relief="flat",
                                          cursor="hand2")
         self.btn_clearbundle.pack(fill="x", pady=1)
+        # _adv_body stays unpacked until Advanced is opened
 
-        self.chips = tk.Label(self.main, text="", font=(MONO[0], 9),
-                              justify="left", anchor="w")
-        self.chips.pack(fill="x", padx=20, pady=(2, 10))
-
-        self._section_header("ii.", "Input Dataset", "stays on your machine")
+        self._section_header("2", "Input Dataset Path", "")
         self.input_field, self.btn_input = self._path_row(
             "Select your extracted dataset folder...", self._pick_input)
 
-        self._section_header("iii.", "Output Location",
-                             "bids_compatible/ written here")
+        self._section_header("3", "Output Path", "")
         self.output_field, self.btn_output = self._path_row(
             "Select an output folder...", self._pick_output)
 
@@ -197,9 +228,9 @@ class App:
     def _section_header(self, no, title, hint):
         h = tk.Frame(self.main)
         h.pack(fill="x", padx=20, pady=(8, 4))
-        lbl_no = tk.Label(h, text=no, font=("Georgia", 13, "italic"))
+        lbl_no = tk.Label(h, text=f"{no} \u00b7 {title}", font=(SANS[0], 11, "bold"))
         lbl_no.pack(side="left")
-        lbl_t = tk.Label(h, text="  " + title, font=(SANS[0], 11, "bold"))
+        lbl_t = tk.Label(h, text="", font=(SANS[0], 11, "bold"))
         lbl_t.pack(side="left")
         lbl_h = tk.Label(h, text=hint, font=(MONO[0], 8))
         lbl_h.pack(side="right")
@@ -231,7 +262,7 @@ class App:
                                  text="\u2600" if self.theme_name == "dark" else "\u263e")
         for (h, lbl_no, lbl_t, lbl_h) in self._headers:
             h.configure(bg=c["panel"])
-            lbl_no.configure(bg=c["panel"], fg=c["accent"])
+            lbl_no.configure(bg=c["panel"], fg=c["txt"])
             lbl_t.configure(bg=c["panel"], fg=c["txt"])
             lbl_h.configure(bg=c["panel"], fg=c["txt_faint"])
         for (row, field, btn) in self._path_rows:
@@ -239,21 +270,34 @@ class App:
             field.configure(bg=c["panel2"], fg=c["txt"],
                             highlightbackground=c["line"], highlightthickness=1)
             self._style_btn(btn)
+        self._simple_row.configure(bg=c["panel"])
+        self.simple_field.configure(bg=c["panel2"], fg=c["txt"],
+                                    highlightbackground=c["line"], highlightthickness=1)
+        self._style_btn(self.btn_simple_select)
+        self._adv_head.configure(bg=c["panel"])
+        self.btn_advanced.configure(bg=c["panel"], fg=c["accent"],
+                                    activebackground=c["panel"],
+                                    activeforeground=c["accent"])
         self.bundle_box.master.configure(bg=c["panel"])
         self.bundle_box.configure(bg=c["panel2"], fg=c["txt_dim"],
                                   highlightbackground=c["line"], highlightthickness=1,
                                   insertbackground=c["txt"])
         for b in [self.btn_addfiles, self.btn_addfolder, self.btn_clearbundle]:
             self._style_btn(b)
-        self.chips.configure(bg=c["panel"], fg=c["txt_dim"])
+        self.chips.configure(bg=c["panel"], fg=c["txt_dim"],
+                             highlightthickness=0)
+        self.chips.tag_config("ok", foreground=c["green"])
+        self.chips.tag_config("miss", foreground=c["red"])
+        self.chips.tag_config("neutral", foreground=c["txt_faint"])
         self.chk_validate.master.configure(bg=c["panel"])
         self.chk_validate.configure(bg=c["panel"], fg=c["txt_dim"],
                                     activebackground=c["panel"],
                                     selectcolor=c["panel2"])
         self.btn_run.master.configure(bg=c["panel"])
-        run_blue = "#3b6fb0" if self.theme_name == "dark" else "#3b82f6"
-        self.btn_run.configure(bg=run_blue, fg="#ffffff",
-                               activebackground=run_blue)
+        # button colour (blue when ready / grey when disabled) is set by
+        # _refresh_run_enabled; call it so a theme toggle keeps the right look
+        if hasattr(self, "bundle_result"):
+            self._refresh_run_enabled()
         self._style_btn(self.btn_clearlog)
         self.lbl_logtitle.master.configure(bg=c["panel"])
         self.lbl_logtitle.configure(bg=c["panel"], fg=c["txt_dim"])
@@ -278,6 +322,71 @@ class App:
         self._apply_theme()
         self._set_state(self._current_state)
 
+    def _pick_bundle_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select downloaded folder from our web")
+        if not folder:
+            return
+        self.simple_field.configure(text=folder, fg=self.theme["txt"])
+        # Treat the chosen folder as the whole bundle (replace any prior).
+        self.bundle_paths = [folder]
+        self.bundle_result = bundle.resolve_bundle([Path(folder)])
+        self._render_bundle_box()
+        self._render_chips()
+        self._autofill_paths_from_ingest()
+        self._refresh_run_enabled()
+
+    def _toggle_advanced(self):
+        self.advanced_open = not self.advanced_open
+        if self.advanced_open:
+            self.btn_advanced.configure(text="\u25be Advanced \u2014 add files manually")
+            self._adv_body.pack(fill="x", padx=20, pady=(0, 4),
+                                after=self._adv_head)
+        else:
+            self.btn_advanced.configure(text="\u25b8 Advanced \u2014 add files manually")
+            self._adv_body.pack_forget()
+
+    def _autofill_paths_from_ingest(self):
+        """If ingest_info.json is in the bundle, read input_path/output_dir and
+        prefill the Input/Output fields. If a path does not exist locally, show
+        it in red so the user knows to pick it manually."""
+        found = getattr(self.bundle_result, "found", {}) or {}
+        info_path = found.get("ingest_info.json")
+        if not info_path:
+            return
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"[WARN] Could not read ingest_info.json: {e}")
+            return
+
+        in_path = data.get("input_path") or data.get("actual_data_path")
+        out_path = data.get("output_dir")
+
+        if in_path:
+            exists = Path(in_path).exists()
+            self.input_dir = in_path if exists else None
+            self.input_field.configure(
+                text=in_path,
+                fg=self.theme["txt"] if exists else self.theme["red"])
+            if not exists:
+                self._append_log(
+                    "[WARN] input_path from ingest_info.json does not exist "
+                    "on this machine - please pick it with Select Folder:")
+                self._append_log(f"        {in_path}")
+        if out_path:
+            exists = Path(out_path).exists()
+            self.output_dir = out_path if exists else None
+            self.output_field.configure(
+                text=out_path,
+                fg=self.theme["txt"] if exists else self.theme["red"])
+            if not exists:
+                self._append_log(
+                    "[WARN] output_dir from ingest_info.json does not exist "
+                    "on this machine - please pick it with Select Folder:")
+                self._append_log(f"        {out_path}")
+
     def _add_files(self):
         files = filedialog.askopenfilenames(title="Add plan files")
         if files:
@@ -291,6 +400,8 @@ class App:
     def _clear_bundle(self):
         self.bundle_paths = []
         self.bundle_result = None
+        self.simple_field.configure(text="Select downloaded folder from our web...",
+                                    fg=self.theme["txt_faint"])
         self._render_bundle_box()
         self._render_chips()
         self._refresh_run_enabled()
@@ -322,20 +433,34 @@ class App:
     def _render_chips(self):
         found = getattr(self.bundle_result, "found", {}) or {}
         provided = self.bundle_result is not None
-        parts = []
-        for name in REQUIRED + OPTIONAL:
-            is_opt = name in OPTIONAL
+        c = self.theme
+
+        self.chips.configure(state="normal")
+        self.chips.delete("1.0", "end")
+
+        # Row 1: required files
+        for i, name in enumerate(REQUIRED):
+            if i:
+                self.chips.insert("end", "    ")
             if name in found:
-                parts.append(f"\u2713 {name}{' (optional)' if is_opt else ''}")
+                self.chips.insert("end", f"\u2713 {name}", "ok")
             elif not provided:
-                parts.append(f"\u25cb {name}{' (optional)' if is_opt else ''}")
-            elif is_opt:
-                parts.append(f"\u25cb {name} (optional)")
+                self.chips.insert("end", f"\u25cb {name}", "neutral")
             else:
-                parts.append(f"\u2717 {name}")
-        mid = (len(parts) + 1) // 2
-        text = "   ".join(parts[:mid]) + "\n" + "   ".join(parts[mid:])
-        self.chips.configure(text=text)
+                # missing required -> red, stays red until user provides it
+                self.chips.insert("end", f"\u2717 {name}", "miss")
+        self.chips.insert("end", "\n")
+
+        # Row 2: supplementary files (not every dataset needs these)
+        for i, name in enumerate(OPTIONAL):
+            if i:
+                self.chips.insert("end", "    ")
+            if name in found:
+                self.chips.insert("end", f"\u2713 {name}", "ok")
+            else:
+                self.chips.insert("end", f"\u25cb {name}", "neutral")
+
+        self.chips.configure(state="disabled")
 
     def _pick_input(self):
         d = filedialog.askdirectory(title="Select input dataset folder")
@@ -355,7 +480,15 @@ class App:
         ready = (self.bundle_result is not None
                  and getattr(self.bundle_result, "is_complete", False)
                  and self.input_dir and self.output_dir and not self.running)
-        self.btn_run.configure(state="normal" if ready else "disabled")
+        c = self.theme
+        if ready:
+            run_blue = "#3b6fb0" if self.theme_name == "dark" else "#3b82f6"
+            self.btn_run.configure(state="normal", bg=run_blue, fg="#ffffff",
+                                   activebackground=run_blue, cursor="hand2")
+        else:
+            self.btn_run.configure(state="disabled", bg=c["panel2"],
+                                   fg=c["txt_faint"], activebackground=c["panel2"],
+                                   cursor="arrow")
 
     def _on_execute(self):
         if self.running:
