@@ -219,3 +219,4 @@ __marimo__/
 
 *.spec
 !execval/build.spec
+!full/build.spec
