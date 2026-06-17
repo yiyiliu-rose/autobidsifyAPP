@@ -1,32 +1,46 @@
 """
-main.py  (Full pipeline)
-========================
+main.py
+=======
 
-AutoBIDSify Full Desktop — Tkinter edition.
+AutoBIDSify ExecVal Desktop — Tkinter edition.
 
-Runs the COMPLETE pipeline (ingest -> validate) locally. The user brings their
-own AI (OpenAI / Ollama local / Ollama remote / DashScope); no AI is bundled,
-and API keys are never written to disk. Replicates the HTML mock-up layout:
-data paths, modality, AI engine tabs, dataset details, a 6-stage progress
-strip, a live log, and a result line.
+A pure-Tkinter GUI (no pywebview / pythonnet / Qt), chosen for the smallest
+possible package and rock-solid PyInstaller packaging. It replicates the
+HTML mock-up's layout: a title bar, three input sections (plan bundle, input
+dataset, output location), a validate option, an Execute button, and a dark
+live-log pane. Light/Dark themes are switchable.
 
-The pipeline runs on a background thread; log lines reach the UI via a queue
-polled on the UI thread (thread-safe Tkinter pattern).
+The conversion runs on a background thread; log lines are passed to the UI
+through a queue and flushed by a periodic poller (the thread-safe Tkinter
+pattern). bundle.py, worker.py and the vendored autobidsify code are unchanged.
 """
 
 from __future__ import annotations
 
 import os
+import json
 import queue
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import tkinter as tk
 from tkinter import filedialog
 
-import worker
+
+def _base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
+_VENDOR = _base_dir() / "vendor"
+if str(_VENDOR) not in sys.path:
+    sys.path.insert(0, str(_VENDOR))
+
+import bundle  # noqa: E402
+import worker  # noqa: E402
 
 
 DARK = {
@@ -42,22 +56,9 @@ LIGHT = {
     "term_bg": "#10151c", "term_txt": "#7ee787", "run_txt": "#ffffff",
 }
 
-MODALITIES = ["mri", "nirs", "eeg", "mixed"]
-STAGES = ["ingest", "evidence", "trio", "plan", "execute", "validate"]
-
-# engine key -> (label, needs_key, needs_url, model choices)
-ENGINES = {
-    "openai": ("OpenAI", True, False,
-               ["gpt-4o", "gpt-4o-mini", "gpt-5.1"]),
-    "ollama-local": ("Ollama - local", False, False,
-                     ["qwen3-coder-next:latest", "qwen3-coder-careful:latest",
-                      "qwen2.5-coder:7b"]),
-    "ollama-remote": ("Ollama - remote", False, True,
-                      ["qwen3-coder-next:latest", "qwen3-coder-careful:latest",
-                       "qwen2.5-coder:7b"]),
-    "dashscope": ("DashScope", True, False,
-                  ["qwen-max", "qwen-plus", "qwen-turbo"]),
-}
+REQUIRED = ["ingest_info.json", "BIDSPlan.yaml", "dataset_description.json",
+            "README.md", "participants.tsv"]
+OPTIONAL = ["mat_mapping.json", "headers_normalized.json", "voxel_final_plan.json"]
 
 _WIN = sys.platform.startswith("win")
 MONO = ("Consolas", 10) if _WIN else ("DejaVu Sans Mono", 10)
@@ -71,401 +72,436 @@ class App:
         self.root = root
         self.theme = LIGHT
         self.theme_name = "light"
+        self.bundle_paths: List[str] = []
+        self.bundle_result = None
         self.input_dir: Optional[str] = None
         self.output_dir: Optional[str] = None
-        self.modality = tk.StringVar(value="mri")
-        self.engine = "openai"
+        self.advanced_open = False
         self.running = False
         self.log_queue = queue.Queue()
-
         self._headers = []
         self._path_rows = []
-        self._mod_btns = {}
-        self._ai_tabs = {}
-        self._stage_labels = {}
 
-        root.title("AutoBIDSify - Full")
-        root.geometry("1180x1200")
+        root.title("AutoBIDSify")
+        root.geometry("1180x1080")
         root.minsize(1000, 900)
-        root.resizable(True, True)
 
         self._build_ui()
         self._apply_theme()
-        self._select_engine("openai")
+        self._render_bundle_box()
+        self._render_chips()
+        self._refresh_run_enabled()
         self.root.after(80, self._drain_log_queue)
 
-    # ---------------- UI ----------------
     def _build_ui(self):
         self.main = tk.Frame(self.root)
         self.main.pack(fill="both", expand=True)
 
-        # title bar
-        tb = tk.Frame(self.main); tb.pack(fill="x", padx=20, pady=(16, 8))
-        self.lbl_name = tk.Label(tb, text="AutoBIDSify",
-                                 font=("Segoe UI", 15, "bold")); self.lbl_name.pack(side="left")
-        self.lbl_tag = tk.Label(tb, text="  full pipeline", font=(SANS[0], 9))
+        self.titlebar = tk.Frame(self.main)
+        self.titlebar.pack(fill="x", padx=20, pady=(16, 8))
+        self.lbl_name = tk.Label(self.titlebar, text="AutoBIDSify",
+                                 font=("Segoe UI", 15, "bold"))
+        self.lbl_name.pack(side="left")
+        self.lbl_tag = tk.Label(self.titlebar, text="  execute & validate",
+                                font=(SANS[0], 9))
         self.lbl_tag.pack(side="left")
-        self.btn_theme = tk.Button(tb, text="\u263e", width=3, relief="flat",
-                                   cursor="hand2", command=self._toggle_theme)
+        self.btn_theme = tk.Button(self.titlebar, text="☾", width=3,
+                                   command=self._toggle_theme, relief="flat",
+                                   cursor="hand2")
         self.btn_theme.pack(side="right")
-        self.lbl_sub = tk.Label(tb, text="any data -> BIDS · runs locally · bring your own AI",
-                                font=(MONO[0], 8)); self.lbl_sub.pack(side="right", padx=10)
-        self._titlebar = tb
+        self.lbl_sub = tk.Label(self.titlebar,
+                                text="offline · no API key · data stays local",
+                                font=(MONO[0], 8))
+        self.lbl_sub.pack(side="right", padx=10)
 
-        # i. Data paths
-        self._section_header("1", "Data Paths", "")
+        self._section_header("1", "Plan Bundle", "from web pipeline")
+
+        # --- Simple mode: one folder field + Select ---
+        simple_row = tk.Frame(self.main)
+        simple_row.pack(fill="x", padx=20, pady=(0, 4))
+        self._simple_row = simple_row
+        self.simple_field = tk.Label(
+            simple_row, text="Select downloaded folder from our web...",
+            font=(MONO[0], 9), anchor="w", relief="flat", borderwidth=1,
+            padx=10, pady=6)
+        self.simple_field.pack(side="left", fill="x", expand=True, ipady=3)
+        self.btn_simple_select = tk.Button(
+            simple_row, text="Select", font=(SANS[0], 10), relief="flat",
+            cursor="hand2", padx=12, pady=4, command=self._pick_bundle_folder)
+        self.btn_simple_select.pack(side="right", padx=(8, 0))
+
+        # --- Advanced toggle ---
+        adv_head = tk.Frame(self.main)
+        adv_head.pack(fill="x", padx=20, pady=(0, 2))
+        self._adv_head = adv_head
+        self.btn_advanced = tk.Button(
+            adv_head, text="\u25b8 Advanced", font=(MONO[0], 9), relief="flat",
+            cursor="hand2", borderwidth=0, command=self._toggle_advanced)
+        self.btn_advanced.pack(side="left")
+
+        # --- Advanced mode (hidden by default): file list + Add/Clear ---
+        bundle_row = tk.Frame(self.main)
+        self._adv_body = bundle_row
+        self.bundle_box = tk.Text(bundle_row, height=3, font=(MONO[0], 9),
+                                  wrap="none", relief="flat", borderwidth=1,
+                                  spacing1=6, padx=10, pady=8)
+        self.bundle_box.pack(side="left", fill="x", expand=True)
+        self.bundle_box.configure(state="disabled")
+        btns = tk.Frame(bundle_row)
+        btns.pack(side="right", padx=(8, 0))
+        self.btn_addfiles = tk.Button(btns, text="Add Files", width=12,
+                                      command=self._add_files, relief="flat",
+                                      cursor="hand2")
+        self.btn_addfiles.pack(fill="x", pady=1)
+        self.btn_addfolder = tk.Button(btns, text="Add Folder", width=12,
+                                       command=self._add_folder, relief="flat",
+                                       cursor="hand2")
+        self.btn_addfolder.pack(fill="x", pady=1)
+        self.btn_clearbundle = tk.Button(btns, text="Clear", width=12,
+                                         command=self._clear_bundle, relief="flat",
+                                         cursor="hand2")
+        self.btn_clearbundle.pack(fill="x", pady=1)
+        # _adv_body stays unpacked until Advanced is opened
+
+        self.chips = tk.Label(self.main, text="", font=(MONO[0], 9),
+                              justify="left", anchor="w")
+        self.chips.pack(fill="x", padx=20, pady=(2, 10))
+
+        self._section_header("2", "Input Dataset", "stays on your machine")
         self.input_field, self.btn_input = self._path_row(
-            "Select input dataset folder...", self._pick_input)
+            "Select your extracted dataset folder...", self._pick_input)
+
+        self._section_header("3", "Output Location",
+                             "bids_compatible/ written here")
         self.output_field, self.btn_output = self._path_row(
-            "Select output folder...", self._pick_output)
+            "Select an output folder...", self._pick_output)
 
-        # ii. Modality
-        self._section_header("2", "Modality", "")
-        modrow = tk.Frame(self.main); modrow.pack(fill="x", padx=20, pady=(0, 2))
-        self._modrow = modrow
-        for m in MODALITIES:
-            b = tk.Button(modrow, text=m.upper(), relief="flat", cursor="hand2",
-                          padx=12, pady=6, command=lambda mm=m: self._set_modality(mm))
-            b.pack(side="left", padx=(0, 6))
-            self._mod_btns[m] = b
+        opt = tk.Frame(self.main)
+        opt.pack(fill="x", padx=20, pady=(6, 10))
+        self.validate_var = tk.BooleanVar(value=True)
+        self.chk_validate = tk.Checkbutton(opt, text="Run validate after execute",
+                                           variable=self.validate_var, font=SANS)
+        self.chk_validate.pack(side="left")
 
-        # iii. AI engine
-        self._section_header("3", "AI Engine", "used in trio & plan stages")
-        tabrow = tk.Frame(self.main); tabrow.pack(fill="x", padx=20, pady=(0, 2))
-        self._tabrow = tabrow
-        for key, (label, *_rest) in ENGINES.items():
-            b = tk.Button(tabrow, text=label, relief="flat", cursor="hand2",
-                          padx=12, pady=6, command=lambda k=key: self._select_engine(k))
-            b.pack(side="left", padx=(0, 6))
-            self._ai_tabs[key] = b
-
-        self.ai_panel = tk.Frame(self.main)
-        self.ai_panel.pack(fill="x", padx=20, pady=(0, 2))
-        # key / url field
-        self.ai_field_label = tk.Label(self.ai_panel, text="", font=(SANS[0], 9),
-                                       anchor="w"); self.ai_field_label.pack(fill="x")
-        self.ai_entry_var = tk.StringVar()
-        self.ai_entry = tk.Entry(self.ai_panel, textvariable=self.ai_entry_var,
-                                 font=(MONO[0], 10), show="")
-        self.ai_entry.pack(fill="x", pady=(2, 8), ipady=4)
-        self.ai_hint = tk.Label(self.ai_panel, text="", font=(MONO[0], 8), anchor="w")
-        self.ai_hint.pack(fill="x")
-        mrow = tk.Frame(self.ai_panel); mrow.pack(fill="x", pady=(8, 0))
-        self._mrow = mrow
-        tk.Label(mrow, text="Model:", font=(SANS[0], 9)).pack(side="left")
-        self.model_var = tk.StringVar()
-        self.model_menu = tk.OptionMenu(mrow, self.model_var, "")
-        self.model_menu.pack(side="left", padx=(8, 0))
-        tk.Label(mrow, text="or custom:", font=(SANS[0], 9)).pack(side="left", padx=(14, 0))
-        self.custom_model_var = tk.StringVar()
-        self.custom_model_entry = tk.Entry(mrow, textvariable=self.custom_model_var,
-                                           font=(MONO[0], 10), width=24)
-        self.custom_model_entry.pack(side="left", padx=(8, 0), ipady=4)
-
-        # iv. Dataset details (always shown)
-        self._section_header("4", "Dataset Details", "")
-        det = tk.Frame(self.main); det.pack(fill="x", padx=20, pady=(0, 2))
-        self._det = det
-
-        r1 = tk.Frame(det); r1.pack(fill="x", pady=3)
-        self.lbl_nsub = tk.Label(r1, text="Number of subjects:", font=(SANS[0], 9), width=22, anchor="w")
-        self.lbl_nsub.pack(side="left")
-        self.nsub_var = tk.StringVar()
-        self.nsub_entry = tk.Entry(r1, textvariable=self.nsub_var, font=(MONO[0], 10), width=12)
-        self.nsub_entry.pack(side="left", ipady=4)
-        self.lbl_nsub_hint = tk.Label(r1, text="  number of subjects (leave empty to auto-detect)",
-                                      font=(MONO[0], 8)); self.lbl_nsub_hint.pack(side="left")
-
-        r2 = tk.Frame(det); r2.pack(fill="x", pady=3)
-        self.lbl_ids = tk.Label(r2, text="Subject ID strategy:", font=(SANS[0], 9), width=22, anchor="w")
-        self.lbl_ids.pack(side="left")
-        self.idstrat = tk.StringVar(value="auto")
-        self._ids_btns = {}
-        for s in ["auto", "numeric", "semantic"]:
-            b = tk.Button(r2, text=s, relief="flat", cursor="hand2", padx=12, pady=6,
-                          command=lambda ss=s: self._set_idstrat(ss))
-            b.pack(side="left", padx=(0, 6))
-            self._ids_btns[s] = b
-        self.lbl_ids_hint = tk.Label(r2, text="  numeric for most; semantic if IDs not unique; auto = default",
-                                     font=(MONO[0], 8)); self.lbl_ids_hint.pack(side="left")
-
-        r3 = tk.Frame(det); r3.pack(fill="x", pady=3)
-        desc_left = tk.Frame(r3); desc_left.pack(side="left", anchor="n")
-        self.lbl_desc = tk.Label(desc_left, text="Description:", font=(SANS[0], 9),
-                                 width=22, anchor="nw")
-        self.lbl_desc.pack(side="top", anchor="nw")
-        self.lbl_desc_hint = tk.Label(desc_left,
-                                      text="describe the dataset\nas fully as possible\n"
-                                           "(modality, tasks,\n#subjects, site, etc.)",
-                                      font=(MONO[0], 8), anchor="nw", justify="left")
-        self.lbl_desc_hint.pack(side="top", anchor="nw", pady=(4, 0))
-        self.desc_text = tk.Text(r3, height=6, font=(SANS[0], 10), wrap="word",
-                                 relief="flat", borderwidth=1)
-        self.desc_text.pack(side="left", fill="x", expand=True)
-        self._desc_left = desc_left
-
-        # actions (Run + Clear + pipeline strip all on one row)
-        act = tk.Frame(self.main); act.pack(fill="x", padx=20, pady=(4, 2))
-        self._act = act
-        self.btn_run = tk.Button(act, text="\u25b6 Run Full Pipeline",
-                                 font=(SANS[0], 10), relief="flat",
-                                 cursor="hand2", padx=12, pady=4, command=self._on_run)
+        act = tk.Frame(self.main)
+        act.pack(fill="x", padx=20, pady=(0, 12))
+        self.btn_run = tk.Button(act, text="\u25b6  Execute",
+                                 font=(SANS[0], 11, "bold"),
+                                 command=self._on_execute, relief="flat",
+                                 cursor="hand2", padx=20, pady=6)
         self.btn_run.pack(side="left")
-        self.btn_clearlog = tk.Button(act, text="Clear Log", font=(SANS[0], 10),
-                                      relief="flat", cursor="hand2",
-                                      padx=12, pady=4, command=self._clear_log)
+        self.btn_clearlog = tk.Button(act, text="Clear Log", command=self._clear_log,
+                                      relief="flat", cursor="hand2", padx=12, pady=6)
         self.btn_clearlog.pack(side="left", padx=8)
 
-        # pipeline strip — packed on the same row, to the right of the buttons
-        strip = tk.Frame(act); strip.pack(side="left", padx=(16, 0))
-        self._strip = strip
-        for i, s in enumerate(STAGES):
-            lbl = tk.Label(strip, text=f"\u25cb {s}", font=(MONO[0], 9))
-            lbl.pack(side="left", padx=(0, 3))
-            self._stage_labels[s] = lbl
-            if i < len(STAGES) - 1:
-                tk.Label(strip, text="\u2192", font=(MONO[0], 9)).pack(side="left", padx=3)
-
-        # log
-        lh = tk.Frame(self.main); lh.pack(fill="x", padx=20, pady=(2, 0))
-        self._lh = lh
-        self.lbl_logtitle = tk.Label(lh, text="LIVE LOG", font=(MONO[0], 8))
+        loghead = tk.Frame(self.main)
+        loghead.pack(fill="x", padx=20)
+        self.lbl_logtitle = tk.Label(loghead, text="LIVE LOG", font=(MONO[0], 8))
         self.lbl_logtitle.pack(side="left")
-        self.lbl_state = tk.Label(lh, text="\u25cf IDLE", font=(MONO[0], 8))
+        self.lbl_state = tk.Label(loghead, text="\u25cf IDLE", font=(MONO[0], 8))
         self.lbl_state.pack(side="right")
-        lf = tk.Frame(self.main); lf.pack(fill="both", expand=True, padx=20, pady=(0, 8))
-        self._lf = lf
-        self.log = tk.Text(lf, font=MONO, wrap="word", relief="flat", borderwidth=0, height=18)
-        sc = tk.Scrollbar(lf, command=self.log.yview)
-        self.log.configure(yscrollcommand=sc.set, state="disabled")
-        sc.pack(side="right", fill="y"); self.log.pack(side="left", fill="both", expand=True)
-        for t, col in [("info", "#7ee787"), ("tag", "#56a8ff"), ("warn", "#e3b341"),
-                       ("err", "#f85149"), ("ok", "#3fb950")]:
-            self.log.tag_config(t, foreground=col)
+
+        logframe = tk.Frame(self.main)
+        logframe.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        self.log = tk.Text(logframe, font=MONO, wrap="word", relief="flat",
+                           borderwidth=0, height=14)
+        scroll = tk.Scrollbar(logframe, command=self.log.yview)
+        self.log.configure(yscrollcommand=scroll.set, state="disabled")
+        scroll.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.log.tag_config("info", foreground="#7ee787")
+        self.log.tag_config("tag", foreground="#56a8ff")
+        self.log.tag_config("warn", foreground="#e3b341")
+        self.log.tag_config("err", foreground="#f85149")
+        self.log.tag_config("ok", foreground="#3fb950")
+
+        foot = tk.Frame(self.main)
+        foot.pack(fill="x", padx=20, pady=(0, 14))
+        self.btn_open = tk.Button(foot, text="Open Output Folder",
+                                  command=self._open_output, relief="flat",
+                                  cursor="hand2", state="disabled")
+        self.btn_open.pack(side="right")
 
     def _section_header(self, no, title, hint):
-        h = tk.Frame(self.main); h.pack(fill="x", padx=20, pady=(4, 2))
-        # H style: number and title in the same weight/colour, joined by " · "
-        num = no.rstrip(".")  # "i." -> "i"; if you switch to arabic, pass "1"
-        a = tk.Label(h, text=f"{num} · {title}", font=(SANS[0], 11, "bold"))
-        a.pack(side="left")
-        b = tk.Label(h, text="", font=(SANS[0], 11, "bold"))  # placeholder, keeps theming list shape
-        c = tk.Label(h, text=hint, font=(MONO[0], 8)); c.pack(side="right")
-        self._headers.append((h, a, b, c))
+        h = tk.Frame(self.main)
+        h.pack(fill="x", padx=20, pady=(8, 4))
+        lbl_no = tk.Label(h, text=f"{no} \u00b7 {title}", font=(SANS[0], 11, "bold"))
+        lbl_no.pack(side="left")
+        lbl_t = tk.Label(h, text="", font=(SANS[0], 11, "bold"))
+        lbl_t.pack(side="left")
+        lbl_h = tk.Label(h, text=hint, font=(MONO[0], 8))
+        lbl_h.pack(side="right")
+        self._headers.append((h, lbl_no, lbl_t, lbl_h))
 
     def _path_row(self, placeholder, cmd):
-        row = tk.Frame(self.main); row.pack(fill="x", padx=20, pady=(0, 2))
+        row = tk.Frame(self.main)
+        row.pack(fill="x", padx=20, pady=(0, 4))
         field = tk.Label(row, text=placeholder, font=(MONO[0], 9), anchor="w",
-                         relief="flat", borderwidth=1, padx=10, pady=4)
-        field.pack(side="left", fill="x", expand=True, ipady=8)
-        btn = tk.Button(row, text="Select Folder", font=(SANS[0], 10), relief="flat",
-                        cursor="hand2", padx=12, pady=4, command=cmd)
+                         relief="flat", borderwidth=1, padx=10, pady=8)
+        field.pack(side="left", fill="x", expand=True)
+        btn = tk.Button(row, text="Select Folder", command=cmd, relief="flat",
+                        cursor="hand2", padx=12)
         btn.pack(side="right", padx=(8, 0))
         self._path_rows.append((row, field, btn))
         return field, btn
 
-    # ---------------- theme ----------------
     def _apply_theme(self):
         c = self.theme
         self.root.configure(bg=c["bg"])
         self.main.configure(bg=c["panel"])
-        for w in [self._titlebar, self.lbl_name, self.lbl_tag, self.lbl_sub]:
+        for w in [self.titlebar, self.lbl_name, self.lbl_tag, self.lbl_sub]:
             w.configure(bg=c["panel"])
-        self.lbl_name.configure(fg=c["txt"]); self.lbl_tag.configure(fg=c["accent"])
+        self.lbl_name.configure(fg=c["txt"])
+        self.lbl_tag.configure(fg=c["accent"])
         self.lbl_sub.configure(fg=c["txt_faint"])
-        self.btn_theme.configure(bg=c["panel2"], fg=c["txt_dim"], activebackground=c["panel2"],
+        self.btn_theme.configure(bg=c["panel2"], fg=c["txt_dim"],
+                                 activebackground=c["panel2"],
                                  text="\u2600" if self.theme_name == "dark" else "\u263e")
-        for (h, a, b, d) in self._headers:
-            h.configure(bg=c["panel"]); a.configure(bg=c["panel"], fg=c["txt"])
-            b.configure(bg=c["panel"], fg=c["txt"]); d.configure(bg=c["panel"], fg=c["txt_faint"])
+        for (h, lbl_no, lbl_t, lbl_h) in self._headers:
+            h.configure(bg=c["panel"])
+            lbl_no.configure(bg=c["panel"], fg=c["txt"])
+            lbl_t.configure(bg=c["panel"], fg=c["txt"])
+            lbl_h.configure(bg=c["panel"], fg=c["txt_faint"])
         for (row, field, btn) in self._path_rows:
             row.configure(bg=c["panel"])
-            field.configure(bg=c["panel2"], fg=c["txt"], highlightbackground=c["line"], highlightthickness=1)
+            field.configure(bg=c["panel2"], fg=c["txt"],
+                            highlightbackground=c["line"], highlightthickness=1)
             self._style_btn(btn)
-        for frame in [self._modrow, self._tabrow, self.ai_panel, self._mrow, self._det,
-                      self._act, self._strip, self._lh, self._lf]:
-            frame.configure(bg=c["panel"])
-        # modality buttons
-        self._refresh_modality_btns()
-        # ai tabs
-        self._refresh_ai_tabs()
-        self.ai_field_label.configure(bg=c["panel"], fg=c["txt_dim"])
-        self.ai_entry.configure(bg=c["panel2"], fg=c["txt"], insertbackground=c["txt"],
-                                highlightbackground=c["line"], highlightthickness=1, relief="flat")
-        self.ai_hint.configure(bg=c["panel"], fg=c["txt_faint"])
-        self.model_menu.configure(bg=c["panel2"], fg=c["txt"], activebackground=c["line"],
-                                  highlightthickness=1, highlightbackground=c["line"], relief="flat")
-        self.custom_model_entry.configure(bg=c["panel2"], fg=c["txt"], insertbackground=c["txt"],
-                                          highlightbackground=c["line"], highlightthickness=1, relief="flat")
-        for child in self._mrow.winfo_children():
-            if isinstance(child, tk.Label):
-                child.configure(bg=c["panel"], fg=c["txt_dim"])
-        # details
-        for w in [self.lbl_nsub, self.lbl_ids, self.lbl_desc]:
-            w.configure(bg=c["panel"], fg=c["txt"])
-        for w in [self.lbl_nsub_hint, self.lbl_ids_hint, self.lbl_desc_hint]:
-            w.configure(bg=c["panel"], fg=c["txt_faint"])
-        for r in [self.nsub_entry]:
-            r.configure(bg=c["panel2"], fg=c["txt"], insertbackground=c["txt"],
-                        highlightbackground=c["line"], highlightthickness=1, relief="flat")
-        for fr in [self.lbl_nsub.master, self.lbl_ids.master, self.lbl_desc.master,
-                   self._desc_left, self.desc_text.master]:
-            fr.configure(bg=c["panel"])
-        self.nsub_entry.master.configure(bg=c["panel"])
-        self.desc_text.configure(bg=c["panel2"], fg=c["txt"], insertbackground=c["txt"],
-                                 highlightbackground=c["line"], highlightthickness=1)
-        self._refresh_idstrat_btns()
-        # actions
-        self.btn_run.configure(bg=("#3b6fb0" if self.theme_name == "dark" else "#3b82f6"),
-                               fg="#ffffff", activebackground=c["accent"])
+        self._simple_row.configure(bg=c["panel"])
+        self.simple_field.configure(bg=c["panel2"], fg=c["txt"],
+                                    highlightbackground=c["line"], highlightthickness=1)
+        self._style_btn(self.btn_simple_select)
+        self._adv_head.configure(bg=c["panel"])
+        self.btn_advanced.configure(bg=c["panel"], fg=c["txt_dim"],
+                                    activebackground=c["panel"])
+        self.bundle_box.master.configure(bg=c["panel"])
+        self.bundle_box.configure(bg=c["panel2"], fg=c["txt_dim"],
+                                  highlightbackground=c["line"], highlightthickness=1,
+                                  insertbackground=c["txt"])
+        for b in [self.btn_addfiles, self.btn_addfolder, self.btn_clearbundle]:
+            self._style_btn(b)
+        self.chips.configure(bg=c["panel"], fg=c["txt_dim"])
+        self.chk_validate.master.configure(bg=c["panel"])
+        self.chk_validate.configure(bg=c["panel"], fg=c["txt_dim"],
+                                    activebackground=c["panel"],
+                                    selectcolor=c["panel2"])
+        self.btn_run.master.configure(bg=c["panel"])
+        run_blue = "#3b6fb0" if self.theme_name == "dark" else "#3b82f6"
+        self.btn_run.configure(bg=run_blue, fg="#ffffff",
+                               activebackground=run_blue)
         self._style_btn(self.btn_clearlog)
-        # strip
-        self._refresh_stage_labels()
-        # log
+        self.lbl_logtitle.master.configure(bg=c["panel"])
         self.lbl_logtitle.configure(bg=c["panel"], fg=c["txt_dim"])
         self.lbl_state.configure(bg=c["panel"], fg=c["txt_faint"])
+        self.log.master.configure(bg=c["panel"])
         self.log.configure(bg=c["term_bg"], fg=c["term_txt"])
+        self.btn_open.master.configure(bg=c["panel"])
+        self.btn_open.configure(bg=c["panel"], fg=c["accent"],
+                                activebackground=c["panel"], borderwidth=0)
 
     def _style_btn(self, b):
         c = self.theme
         b.configure(bg=c["panel2"], fg=c["txt"], activebackground=c["line"],
-                    highlightbackground=c["line"], highlightthickness=1, borderwidth=0)
+                    highlightbackground=c["line"], highlightthickness=1,
+                    borderwidth=0)
 
     def _toggle_theme(self):
-        self.theme, self.theme_name = (LIGHT, "light") if self.theme_name == "dark" else (DARK, "dark")
+        if self.theme_name == "dark":
+            self.theme, self.theme_name = LIGHT, "light"
+        else:
+            self.theme, self.theme_name = DARK, "dark"
         self._apply_theme()
         self._set_state(self._current_state)
 
-    # ---------------- modality / engine / idstrat ----------------
-    def _set_modality(self, m):
-        self.modality.set(m); self._refresh_modality_btns()
+    def _pick_bundle_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select downloaded folder from our web")
+        if not folder:
+            return
+        self.simple_field.configure(text=folder, fg=self.theme["txt"])
+        # Treat the chosen folder as the whole bundle (replace any prior).
+        self.bundle_paths = [folder]
+        self.bundle_result = bundle.resolve_bundle([Path(folder)])
+        self._render_bundle_box()
+        self._render_chips()
+        self._autofill_paths_from_ingest()
+        self._refresh_run_enabled()
 
-    def _refresh_modality_btns(self):
-        c = self.theme
-        for m, b in self._mod_btns.items():
-            if m == self.modality.get():
-                b.configure(bg=c["accent"], fg=c["run_txt"], activebackground=c["accent"],
-                            highlightthickness=1, highlightbackground=c["line"], borderwidth=0)
-            else:
-                self._style_btn(b)
-
-    def _set_idstrat(self, s):
-        self.idstrat.set(s); self._refresh_idstrat_btns()
-
-    def _refresh_idstrat_btns(self):
-        c = self.theme
-        for s, b in self._ids_btns.items():
-            if s == self.idstrat.get():
-                b.configure(bg=c["accent"], fg=c["run_txt"], activebackground=c["accent"],
-                            highlightthickness=1, highlightbackground=c["line"], borderwidth=0)
-            else:
-                self._style_btn(b)
-
-    def _select_engine(self, key):
-        self.engine = key
-        label, needs_key, needs_url, models = ENGINES[key]
-        # field label + entry behavior
-        if needs_key:
-            self.ai_field_label.configure(text="API key (required) - never saved, re-enter each run")
-            self.ai_entry.configure(show="*")
-            self.ai_entry_var.set("")
-        elif needs_url:
-            self.ai_field_label.configure(text="Base URL (required)")
-            self.ai_entry.configure(show="")
-            self.ai_entry_var.set("")
+    def _toggle_advanced(self):
+        self.advanced_open = not self.advanced_open
+        if self.advanced_open:
+            self.btn_advanced.configure(text="\u25be Advanced")
+            self._adv_body.pack(fill="x", padx=20, pady=(0, 4),
+                                after=self._adv_head)
         else:
-            # ollama-local: editable URL field, prefilled with the default.
-            self.ai_field_label.configure(text="Base URL (local Ollama, editable)")
-            self.ai_entry.configure(show="")
-            self.ai_entry_var.set("http://localhost:11434")
-        hints = {
-            "openai": "OPENAI_API_KEY",
-            "dashscope": "DASHSCOPE_API_KEY - Alibaba Cloud cloud alternative",
-            "ollama-remote": "OLLAMA_BASE_URL  e.g. http://your-server.com:11434",
-            "ollama-local": "run `ollama serve` first",
-        }
-        self.ai_hint.configure(text=hints.get(key, ""))
-        self.ai_entry.configure(state="normal")
-        # model menu
-        menu = self.model_menu["menu"]; menu.delete(0, "end")
-        for m in models:
-            menu.add_command(label=m, command=lambda v=m: self.model_var.set(v))
-        self.model_var.set(models[0])
-        self._refresh_ai_tabs()
+            self.btn_advanced.configure(text="\u25b8 Advanced")
+            self._adv_body.pack_forget()
 
-    def _refresh_ai_tabs(self):
-        c = self.theme
-        for key, b in self._ai_tabs.items():
-            if key == self.engine:
-                b.configure(bg=c["accent"], fg=c["run_txt"], activebackground=c["accent"],
-                            highlightthickness=1, highlightbackground=c["line"], borderwidth=0)
+    def _autofill_paths_from_ingest(self):
+        """If ingest_info.json is in the bundle, read input_path/output_dir and
+        prefill the Input/Output fields. If a path does not exist locally, show
+        it in red so the user knows to pick it manually."""
+        found = getattr(self.bundle_result, "found", {}) or {}
+        info_path = found.get("ingest_info.json")
+        if not info_path:
+            return
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"[WARN] Could not read ingest_info.json: {e}")
+            return
+
+        in_path = data.get("input_path") or data.get("actual_data_path")
+        out_path = data.get("output_dir")
+
+        if in_path:
+            exists = Path(in_path).exists()
+            self.input_dir = in_path if exists else None
+            self.input_field.configure(
+                text=in_path,
+                fg=self.theme["txt"] if exists else self.theme["red"])
+            if not exists:
+                self._append_log(
+                    "[WARN] input_path from ingest_info.json does not exist "
+                    "on this machine - please pick it with Select Folder:")
+                self._append_log(f"        {in_path}")
+        if out_path:
+            exists = Path(out_path).exists()
+            self.output_dir = out_path if exists else None
+            self.output_field.configure(
+                text=out_path,
+                fg=self.theme["txt"] if exists else self.theme["red"])
+            if not exists:
+                self._append_log(
+                    "[WARN] output_dir from ingest_info.json does not exist "
+                    "on this machine - please pick it with Select Folder:")
+                self._append_log(f"        {out_path}")
+
+    def _add_files(self):
+        files = filedialog.askopenfilenames(title="Add plan files")
+        if files:
+            self._add_paths(list(files))
+
+    def _add_folder(self):
+        folder = filedialog.askdirectory(title="Add a folder")
+        if folder:
+            self._add_paths([folder])
+
+    def _clear_bundle(self):
+        self.bundle_paths = []
+        self.bundle_result = None
+        self.simple_field.configure(text="Select downloaded folder from our web...",
+                                    fg=self.theme["txt_faint"])
+        self._render_bundle_box()
+        self._render_chips()
+        self._refresh_run_enabled()
+
+    def _add_paths(self, paths):
+        for p in paths:
+            if p not in self.bundle_paths:
+                self.bundle_paths.append(p)
+        self._render_bundle_box()
+        self.bundle_result = bundle.resolve_bundle(
+            [Path(p) for p in self.bundle_paths])
+        self._render_chips()
+        self._refresh_run_enabled()
+
+    def _render_bundle_box(self):
+        self.bundle_box.configure(state="normal")
+        self.bundle_box.delete("1.0", "end")
+        if not self.bundle_paths:
+            self.bundle_box.insert("end", "No items added yet\n"
+                                   "(add files incl. .zip and/or folders)")
+        else:
+            self.bundle_box.insert("end", f"{len(self.bundle_paths)} item(s):\n")
+            for p in self.bundle_paths:
+                parts = Path(p).parts
+                short = "/".join(parts[-2:]) if len(parts) > 1 else p
+                self.bundle_box.insert("end", f"  - {short}\n")
+        self.bundle_box.configure(state="disabled")
+
+    def _render_chips(self):
+        found = getattr(self.bundle_result, "found", {}) or {}
+        provided = self.bundle_result is not None
+        parts = []
+        for name in REQUIRED + OPTIONAL:
+            is_opt = name in OPTIONAL
+            if name in found:
+                parts.append(f"\u2713 {name}{' (optional)' if is_opt else ''}")
+            elif not provided:
+                parts.append(f"\u25cb {name}{' (optional)' if is_opt else ''}")
+            elif is_opt:
+                parts.append(f"\u25cb {name} (optional)")
             else:
-                self._style_btn(b)
+                parts.append(f"\u2717 {name}")
+        mid = (len(parts) + 1) // 2
+        text = "   ".join(parts[:mid]) + "\n" + "   ".join(parts[mid:])
+        self.chips.configure(text=text)
 
-    # ---------------- pickers ----------------
     def _pick_input(self):
         d = filedialog.askdirectory(title="Select input dataset folder")
         if d:
-            self.input_dir = d; self.input_field.configure(text=d, fg=self.theme["txt"])
+            self.input_dir = d
+            self.input_field.configure(text=d, fg=self.theme["txt"])
+            self._refresh_run_enabled()
 
     def _pick_output(self):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
-            self.output_dir = d; self.output_field.configure(text=d, fg=self.theme["txt"])
+            self.output_dir = d
+            self.output_field.configure(text=d, fg=self.theme["txt"])
+            self._refresh_run_enabled()
 
-    # ---------------- run ----------------
-    def _on_run(self):
+    def _refresh_run_enabled(self):
+        ready = (self.bundle_result is not None
+                 and getattr(self.bundle_result, "is_complete", False)
+                 and self.input_dir and self.output_dir and not self.running)
+        self.btn_run.configure(state="normal" if ready else "disabled")
+
+    def _on_execute(self):
         if self.running:
             return
-        if not self.input_dir or not self.output_dir:
-            self._append_log("[WARN] Please select both input and output folders."); return
-        label, needs_key, needs_url, _models = ENGINES[self.engine]
-        val = self.ai_entry_var.get().strip()
-        if needs_key and not val:
-            self._append_log(f"[WARN] {label} requires an API key."); return
-        if needs_url and not val:
-            self._append_log(f"[WARN] {label} requires a Base URL."); return
-
-        nsub = self.nsub_var.get().strip()
-        nsubjects = int(nsub) if nsub.isdigit() else None
-        describe = self.desc_text.get("1.0", "end").strip()
-
-        custom_model = self.custom_model_var.get().strip()
-        chosen_model = custom_model if custom_model else self.model_var.get()
-        is_url_engine = needs_url or self.engine == "ollama-local"
-        cfg = dict(
-            input_dir=Path(self.input_dir), output_dir=Path(self.output_dir),
-            engine=self.engine, model=chosen_model,
-            api_key=val if needs_key else "", base_url=val if is_url_engine else "",
-            modality=self.modality.get(), nsubjects=nsubjects,
-            id_strategy=self.idstrat.get(), describe=describe,
-        )
         self._clear_log()
-        self._reset_stages()
+        self.btn_open.configure(state="disabled")
         self.running = True
         self._set_state("running")
-        self.btn_run.configure(state="disabled")
-        threading.Thread(target=self._worker_thread, args=(cfg,), daemon=True).start()
+        self._refresh_run_enabled()
+        threading.Thread(target=self._worker_thread, daemon=True).start()
 
-    def _worker_thread(self, cfg):
+    def _worker_thread(self):
+        resolver = None
         try:
-            code = worker.run(log=lambda l: self.log_queue.put(("log", l)), **cfg)
+            resolver = bundle.BundleResolver()
+            resolved = resolver.resolve([Path(p) for p in self.bundle_paths])
+            found = {k: str(v) for k, v in resolved.found.items()}
+            code = worker.run(
+                found=found,
+                input_root=Path(self.input_dir),
+                output_dir=Path(self.output_dir),
+                do_validate=self.validate_var.get(),
+                log=lambda line: self.log_queue.put(("log", line)),
+            )
             self.log_queue.put(("state", "done" if code == 0 else "error"))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.log_queue.put(("log", f"[FATAL] {e}"))
             self.log_queue.put(("state", "error"))
+        finally:
+            if resolver is not None:
+                resolver.cleanup()
 
-    # ---------------- log queue ----------------
     def _drain_log_queue(self):
         try:
             while True:
                 kind, payload = self.log_queue.get_nowait()
                 if kind == "log":
-                    self._append_log(payload); self._update_stage_from_log(payload)
+                    self._append_log(payload)
                 elif kind == "state":
                     self.running = False
                     self._set_state(payload)
-                    self.btn_run.configure(state="normal")
+                    if payload == "done":
+                        self.btn_open.configure(state="normal")
+                    self._refresh_run_enabled()
         except queue.Empty:
             pass
         self.root.after(80, self._drain_log_queue)
@@ -481,50 +517,14 @@ class App:
         elif "[INFO]" in line or "[WORKER]" in line:
             tag = "tag"
         self.log.configure(state="normal")
-        self.log.insert("end", line + "\n", tag); self.log.see("end")
+        self.log.insert("end", line + "\n", tag)
+        self.log.see("end")
         self.log.configure(state="disabled")
 
     def _clear_log(self):
-        self.log.configure(state="normal"); self.log.delete("1.0", "end")
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-
-    # ---------------- stages ----------------
-    def _reset_stages(self):
-        for s, lbl in self._stage_labels.items():
-            lbl.configure(text=f"\u25cb {s}", fg=self.theme["txt_faint"])
-
-    def _refresh_stage_labels(self):
-        # re-apply colors after theme change (keep current marks)
-        for s, lbl in self._stage_labels.items():
-            txt = lbl.cget("text")
-            lbl.configure(bg=self.theme["panel"])
-            if txt.startswith("\u2713"):
-                lbl.configure(fg=self.theme["green"])
-            elif txt.startswith("\u25cf"):
-                lbl.configure(fg=self.theme["accent"])
-            else:
-                lbl.configure(fg=self.theme["txt_faint"])
-        for child in self._strip.winfo_children():
-            if isinstance(child, tk.Label) and child.cget("text") == "\u2192":
-                child.configure(bg=self.theme["panel"], fg=self.theme["txt_faint"])
-
-    def _update_stage_from_log(self, line):
-        low = line.lower()
-        # mark a stage active when its name appears in a stage header line
-        for s in STAGES:
-            if s in low and ("stage" in low or "===" in low or "/7]" in low or "generating" in low or "running" in low):
-                # mark previous as done, this as active
-                hit = False
-                for ss in STAGES:
-                    lbl = self._stage_labels[ss]
-                    if ss == s:
-                        lbl.configure(text=f"\u25cf {ss}", fg=self.theme["accent"]); hit = True
-                    elif not hit:
-                        lbl.configure(text=f"\u2713 {ss}", fg=self.theme["green"])
-                break
-        if "pipeline complete" in low or line.strip() == "[WORKER] Done.":
-            for ss in STAGES:
-                self._stage_labels[ss].configure(text=f"\u2713 {ss}", fg=self.theme["green"])
 
     def _set_state(self, s):
         self._current_state = s
@@ -532,11 +532,28 @@ class App:
                   "done": "\u25cf DONE", "error": "\u25cf ERROR"}
         colors = {"idle": self.theme["txt_faint"], "running": self.theme["green"],
                   "done": self.theme["green"], "error": self.theme["red"]}
-        self.lbl_state.configure(text=labels.get(s, "\u25cf IDLE"), fg=colors.get(s, self.theme["txt_faint"]))
+        self.lbl_state.configure(text=labels.get(s, "\u25cf IDLE"),
+                                 fg=colors.get(s, self.theme["txt_faint"]))
+
+    def _open_output(self):
+        if not self.output_dir:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(self.output_dir)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", self.output_dir])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", self.output_dir])
+        except Exception:
+            pass
 
 
 def main():
-    if sys.platform.startswith("win"):
+    # Crisp rendering on Windows high-DPI displays (avoids blurry scaling).
+    if sys.platform.startswith('win'):
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
