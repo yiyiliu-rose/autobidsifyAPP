@@ -55,6 +55,7 @@ def test_case_insensitive_match(tmp_path):
     """File names match regardless of case (e.g. readme.md)."""
     root = tmp_path / "b"
     root.mkdir()
+    (root / "ingest_info.json").write_text("{}")
     (root / "BIDSPlan.yaml").write_text("{}")
     (root / "dataset_description.json").write_text("{}")
     (root / "readme.md").write_text("x")          # lowercase

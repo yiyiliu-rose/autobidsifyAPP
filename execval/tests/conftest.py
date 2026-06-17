@@ -22,6 +22,7 @@ if str(EXECVAL_DIR) not in sys.path:
 
 # Canonical plan-bundle filenames (kept in sync with bundle.py).
 REQUIRED = [
+    "ingest_info.json",
     "BIDSPlan.yaml",
     "dataset_description.json",
     "README.md",
