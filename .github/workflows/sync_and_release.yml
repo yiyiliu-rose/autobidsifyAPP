@@ -96,15 +96,15 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: AutoBIDSify-Windows
+            artifact: AutoBIDSify-ExecVal-Windows
             archive: zip
             pyver: "3.14"
           - os: macos-latest
-            artifact: AutoBIDSify-macOS-arm64
+            artifact: AutoBIDSify-ExecVal-macOS-arm64
             archive: zip
             pyver: "3.14"
           - os: ubuntu-22.04
-            artifact: AutoBIDSify-Linux
+            artifact: AutoBIDSify-ExecVal-Linux
             archive: tar
             pyver: "3.12"
     defaults:
@@ -193,9 +193,31 @@ jobs:
             Auto-built after an autobidsify PyPI release that changed the core files.
 
             Downloads:
-            - Windows: AutoBIDSify-Windows.zip
-            - macOS (Apple Silicon): AutoBIDSify-macOS-arm64.zip
-            - Linux: AutoBIDSify-Linux.tar.gz
+            - Windows: AutoBIDSify-ExecVal-Windows.zip
+            - macOS (Apple Silicon): AutoBIDSify-ExecVal-macOS-arm64.zip
+            - Linux: AutoBIDSify-ExecVal-Linux.tar.gz
+
+            Linux note: requires a desktop environment (Tk). Built for GLIBC 2.35+.
+          files: release_files/**/*
+          draft: false
+          prerelease: false
+
+      # Also update a fixed "latest" release so users always have a stable
+      # download link that points to the newest build.
+      - name: Publish/refresh the latest release (stable link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-execval
+          name: AutoBIDSify ExecVal (latest)
+          body: |
+            AutoBIDSify ExecVal desktop app — local execute & validate.
+            This is the LATEST build; the download links below always point to
+            the newest version.
+
+            Downloads:
+            - Windows: AutoBIDSify-ExecVal-Windows.zip
+            - macOS (Apple Silicon): AutoBIDSify-ExecVal-macOS-arm64.zip
+            - Linux: AutoBIDSify-ExecVal-Linux.tar.gz
 
             Linux note: requires a desktop environment (Tk). Built for GLIBC 2.35+.
           files: release_files/**/*
