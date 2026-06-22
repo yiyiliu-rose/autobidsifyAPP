@@ -94,8 +94,40 @@ class App:
         self.root.after(80, self._drain_log_queue)
 
     def _build_ui(self):
-        self.main = tk.Frame(self.root)
-        self.main.pack(fill="both", expand=True)
+        # Outer scrollable container so the whole UI can scroll when the window
+        # is shorter than the content (e.g. on Linux/HiDPI).
+        outer = tk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+        self._outer = outer
+        self.canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self._vscroll = tk.Scrollbar(outer, orient="vertical",
+                                     command=self.canvas.yview)
+        self._vscroll.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=self._vscroll.set)
+
+        self.main = tk.Frame(self.canvas)
+        self._main_window = self.canvas.create_window((0, 0), window=self.main,
+                                                      anchor="nw")
+
+        def _on_main_config(event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.main.bind("<Configure>", _on_main_config)
+
+        def _on_canvas_config(event):
+            self.canvas.itemconfigure(self._main_window, width=event.width)
+        self.canvas.bind("<Configure>", _on_canvas_config)
+
+        def _on_wheel(event):
+            if event.num == 4:
+                self.canvas.yview_scroll(-3, "units")
+            elif event.num == 5:
+                self.canvas.yview_scroll(3, "units")
+            else:
+                self.canvas.yview_scroll(int(-1 * (event.delta / 40)), "units")
+        self.canvas.bind_all("<MouseWheel>", _on_wheel)
+        self.canvas.bind_all("<Button-4>", _on_wheel)
+        self.canvas.bind_all("<Button-5>", _on_wheel)
 
         self.titlebar = tk.Frame(self.main)
         self.titlebar.pack(fill="x", padx=20, pady=(16, 8))
@@ -205,7 +237,7 @@ class App:
         self.lbl_state.pack(side="right")
 
         logframe = tk.Frame(self.main)
-        logframe.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        logframe.pack(fill="x", padx=20, pady=(0, 8))
         self.log = tk.Text(logframe, font=MONO, wrap="word", relief="flat",
                            borderwidth=0, height=14)
         scroll = tk.Scrollbar(logframe, command=self.log.yview)
@@ -251,6 +283,8 @@ class App:
     def _apply_theme(self):
         c = self.theme
         self.root.configure(bg=c["bg"])
+        self._outer.configure(bg=c["panel"])
+        self.canvas.configure(bg=c["panel"])
         self.main.configure(bg=c["panel"])
         for w in [self.titlebar, self.lbl_name, self.lbl_tag, self.lbl_sub]:
             w.configure(bg=c["panel"])
