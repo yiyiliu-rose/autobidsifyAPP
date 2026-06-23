@@ -85,7 +85,7 @@ class App:
         self._ids_btns = {}
 
         root.title("AutoBIDSify - Full")
-        root.geometry("1180x1200")
+        root.geometry("1000x1000")
         root.minsize(1000, 900)
         root.resizable(True, True)
 

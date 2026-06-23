@@ -83,7 +83,7 @@ class App:
         self._path_rows = []
 
         root.title("AutoBIDSify")
-        root.geometry("1180x1080")
+        root.geometry("940x940")
         root.minsize(1000, 900)
 
         self._build_ui()
