@@ -83,7 +83,7 @@ class App:
         self._path_rows = []
 
         root.title("AutoBIDSify")
-        root.geometry("940x940")
+        root.geometry("1180x1080")
         root.minsize(1000, 900)
 
         self._build_ui()
@@ -625,7 +625,13 @@ def main():
         except Exception:
             pass
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    w = min(900, sw - 40)
+    h = min(760, sh - 80)
+    root.geometry(f"{w}x{h}")
     root.mainloop()
 
 

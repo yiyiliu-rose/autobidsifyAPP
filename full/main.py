@@ -85,7 +85,7 @@ class App:
         self._ids_btns = {}
 
         root.title("AutoBIDSify - Full")
-        root.geometry("1000x1000")
+        root.geometry("1180x1200")
         root.minsize(1000, 900)
         root.resizable(True, True)
 
@@ -579,7 +579,16 @@ def main():
         except Exception:
             pass
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    # Some Linux window managers ignore the initial geometry() call, and remote
+    # desktops (x2go) have limited usable height. After layout, cap the window
+    # to the available screen height so it never runs off-screen.
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    w = min(900, sw - 40)
+    h = min(760, sh - 80)          # leave room for panels/taskbars
+    root.geometry(f"{w}x{h}")
     root.mainloop()
 
 
